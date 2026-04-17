@@ -1,0 +1,47 @@
+/* ============================================================
+   CHUNK 1: TERM_DIM WITH SEQUENCE
+   Validates: term ordering, suffix labels, academic year
+   Expected: one row per RSCC term, sequence integers with
+             no gaps, correct TT suffix mapping
+   ============================================================ */
+SELECT
+    t.STVTERM_CODE                          AS term_id,
+    ROW_NUMBER() OVER (
+        ORDER BY t.STVTERM_CODE
+    )                                       AS term_sequence,
+    t.STVTERM_DESC                          AS term_desc,
+    CASE SUBSTR(t.STVTERM_CODE, 5, 2)
+        WHEN '10' THEN 'Spring'
+        WHEN '50' THEN 'Summer'
+        WHEN '80' THEN 'Fall'
+        ELSE 'Other'
+    END                                     AS term_type,
+    SUBSTR(t.STVTERM_CODE, 1, 4)            AS term_year,
+
+  CASE SUBSTR(t.STVTERM_CODE, 5, 2)
+    WHEN '10' THEN
+        SUBSTR(TO_CHAR(TO_NUMBER(SUBSTR(t.STVTERM_CODE,1,4)) - 1), 3, 2)
+        || '-'
+        || SUBSTR(t.STVTERM_CODE, 3, 2)
+    WHEN '50' THEN
+        SUBSTR(t.STVTERM_CODE, 3, 2)
+        || '-'
+        || TO_CHAR(TO_NUMBER(SUBSTR(t.STVTERM_CODE,1,4)) + 1 - 2000)
+    WHEN '80' THEN
+        SUBSTR(t.STVTERM_CODE, 3, 2)
+        || '-'
+        || TO_CHAR(TO_NUMBER(SUBSTR(t.STVTERM_CODE,1,4)) + 1 - 2000)
+    ELSE SUBSTR(t.STVTERM_CODE, 1, 4)
+END                                     AS academic_year,
+    b.SOBPTRM_START_DATE                    AS term_start_date,
+    b.SOBPTRM_END_DATE                      AS term_end_date
+
+    FROM
+    STVTERM t
+    LEFT JOIN SOBPTRM b
+        ON  b.SOBPTRM_TERM_CODE = t.STVTERM_CODE
+        AND b.SOBPTRM_PTRM_CODE = '1'
+WHERE
+    t.STVTERM_CODE >= '202080'
+ORDER BY
+    t.STVTERM_CODE
