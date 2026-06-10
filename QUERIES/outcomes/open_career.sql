@@ -270,7 +270,6 @@ cohort AS (
         NVL(mat.major_code, mv.major_code)            AS cohort_major_code,
         mat.concentration_code                        AS cohort_concentration_code,
         NVL(pc.prior_cum_hrs, 0)                      AS prior_cum_hrs,
-        sg.SGBSTDN_FULL_PART_IND                      AS full_part_ind,
         it.inst_entry_term_id,
         td_inst.term_sequence                         AS inst_entry_term_sequence,
         CASE
@@ -538,10 +537,9 @@ SELECT /*+ GATHER_PLAN_STATISTICS */
         ELSE 'Changed Major'
     END                                         AS major_change_flag,
     0                                           AS next_term_matriculation_flag,
-    NULL                                        AS oc_gateway_flag,
     0                                           AS graduated_other_closed_flag,
     0                                           AS enrolled_other_closed_flag,
-    c.full_part_ind,
+    NULL                                        AS oc_gateway_flag,
     SYSDATE                                     AS ExtractDate
 FROM cohort c
 CROSS JOIN max_term mt
