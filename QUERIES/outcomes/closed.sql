@@ -247,7 +247,7 @@ cohort_terms AS (
 max_term AS (
     SELECT MAX(term_sequence) AS max_seq FROM term_dim
 ),
-spbpers AS (
+birth_dates AS (
     SELECT
         SPBPERS_PIDM       AS pidm,
         SPBPERS_BIRTH_DATE AS birth_date
@@ -356,7 +356,7 @@ SELECT
     END                                             AS age_group,
     SYSDATE                                         AS ExtractDate
 FROM retention r
-LEFT JOIN spbpers bp
+LEFT JOIN birth_dates bp
     ON  bp.pidm = r.pidm
 LEFT JOIN term_dim td_e
     ON  td_e.term_id = r.cohort_entry_term_id
