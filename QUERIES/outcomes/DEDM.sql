@@ -4,23 +4,13 @@
 -- Grain: one row per student per cohort entry term
 -- Output: outcomes_DE_DM.csv via Argos SFTP
 -- Refresh cadence: Per term (full rebuild)
--- Union schema: 51 columns (v1)
---
--- Cohort logic: SGBSTDN_ADMT_CODE IN ('DE','DM').
--- SORLCUR not used for cohort inclusion — avoids the
--- SORLCUR x SFVRCRS temp space issue in Argos.
--- SORLCUR used only in sorlcur_at_term (current-state
--- lookup, bounded to cohort pidms via student_max_term).
---
--- Parameters:
---   :Term  -- cohort floor term (e.g. 202080)
 -- ==================================================
 
 WITH
 
 term_dim AS (
     SELECT
-        t.STVTERM_CODE                              AS term_id,
+        t.STVTERM_CODE                               AS term_id,
         ROW_NUMBER() OVER (ORDER BY t.STVTERM_CODE) AS term_sequence,
         b.SOBPTRM_START_DATE                        AS term_start_date,
         b.SOBPTRM_END_DATE                          AS term_end_date
@@ -31,12 +21,22 @@ term_dim AS (
 ),
 
 current_fs_term AS (
-    -- Most recent Fall or Spring term up to TERM1.
-    -- Gates currently_enrolled_flag away from summer artifacts.
     SELECT MAX(STVTERM_CODE) AS fs_term_id
     FROM STVTERM
     WHERE STVTERM_CODE <= F_RSCC_GET_TERM('TERM1')
     AND   SUBSTR(STVTERM_CODE, 5, 2) IN ('10', '80')
+),
+
+-- OPTIMIZATION: Narrow down the target PIDM pool early 
+-- to prevent global scans on SHRTGPA and SFVRCRS history.
+cohort_pidms AS (
+    SELECT DISTINCT sf.PIDM_A3 AS pidm
+    FROM SFVRCRS sf
+    JOIN SGBSTDN sg ON sg.ROWID = F_GET_SGBSTDN_ROWID(sf.PIDM_A3, sf.TERM_CODE_A3)
+    WHERE sf.TERM_CODE_A3 >= :Term
+    AND   sf.TERM_CODE_A3 <= F_RSCC_GET_TERM('TERM1')
+    AND   sf.TOT_CRHRS_A3 > 0
+    AND   sg.SGBSTDN_ADMT_CODE IN ('DE','DM')
 ),
 
 prior_cum AS (
@@ -50,12 +50,11 @@ prior_cum AS (
         ) AS prior_cum_hrs
     FROM SHRTGPA g
     WHERE g.SHRTGPA_LEVL_CODE  = 'UG'
-    AND g.SHRTGPA_GPA_TYPE_IND = 'I'
+    AND   g.SHRTGPA_GPA_TYPE_IND = 'I'
+    AND   g.SHRTGPA_PIDM IN (SELECT pidm FROM cohort_pidms)
 ),
 
 ft_term_counts AS (
-    -- Full history FT term count per student per DE/DM admit code.
-    -- No floor date -- required for accurate DM/DC/DE classification.
     SELECT
         sf.PIDM_A3             AS pidm,
         sg2.SGBSTDN_ADMT_CODE  AS admit_code,
@@ -65,18 +64,13 @@ ft_term_counts AS (
         ON sg2.ROWID = F_GET_SGBSTDN_ROWID(sf.PIDM_A3, sf.TERM_CODE_A3)
     WHERE sf.TOT_CRHRS_A3         >= 12
     AND   sg2.SGBSTDN_ADMT_CODE    IN ('DE','DM')
+    AND   sf.PIDM_A3 IN (SELECT pidm FROM cohort_pidms)
     GROUP BY sf.PIDM_A3, sg2.SGBSTDN_ADMT_CODE
 ),
 
 cohort AS (
-    -- Combined DE/DM/DC cohort anchored on SGBSTDN_ADMT_CODE.
-    -- cohort_type_code derived from FT term count heuristic:
-    --   DM = DM admit + 1+ FT terms
-    --   DC = DE admit + exactly 2 FT terms
-    --   DE = all others
-    -- misclassified_dm_flag: DM admit with 0 FT terms
-    -- de_as_dm_flag: DE admit with 3+ FT terms
-    SELECT
+    -- Added MATERIALIZE hint to force Oracle to write this baseline once to temporary memory
+    SELECT /*+ MATERIALIZE */
         spr.SPRIDEN_ID
             || '-'
             || CASE
@@ -153,7 +147,6 @@ cohort AS (
 ),
 
 post_enr AS (
-    -- admt_code carried for current-state DE/DM exit detection.
     SELECT
         sf.PIDM_A3              AS pidm,
         sf.TERM_CODE_A3         AS term_id,
@@ -195,10 +188,9 @@ earned_by_term AS (
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS cum_earned_hrs
     FROM SHRTGPA g
-    JOIN cohort c
-        ON  c.pidm = g.SHRTGPA_PIDM
     WHERE g.SHRTGPA_LEVL_CODE  = 'UG'
     AND   g.SHRTGPA_GPA_TYPE_IND = 'I'
+    AND   g.SHRTGPA_PIDM IN (SELECT pidm FROM cohort_pidms)
 ),
 
 awards AS (
@@ -213,14 +205,11 @@ awards AS (
             ORDER BY td.term_sequence ASC
         ) AS award_seq
     FROM SHRDGMR shd
-    JOIN cohort c
-        ON  c.pidm = shd.SHRDGMR_PIDM
     JOIN term_dim td
         ON  td.term_id = shd.SHRDGMR_TERM_CODE_GRAD
     WHERE shd.SHRDGMR_DEGS_CODE       = 'AW'
-    AND   shd.SHRDGMR_TERM_CODE_GRAD >= (
-        SELECT MIN(c2.cohort_entry_term_id) FROM cohort c2
-    )
+    AND   shd.SHRDGMR_TERM_CODE_GRAD >= :Term
+    AND   shd.SHRDGMR_PIDM IN (SELECT pidm FROM cohort_pidms)
 ),
 
 first_award AS (
@@ -254,10 +243,10 @@ outcomes AS (
                  < c.entry_term_sequence + 1
             THEN NULL
             WHEN MAX(CASE WHEN ct.term_sequence = c.entry_term_sequence + 1
-                     THEN 1 ELSE 0 END) = 1
+                          THEN 1 ELSE 0 END) = 1
               OR MIN(CASE WHEN fa.pidm IS NOT NULL
-                     THEN fa.first_award_term_sequence
-                     ELSE NULL END) <= c.entry_term_sequence + 1
+                          THEN fa.first_award_term_sequence
+                          ELSE NULL END) <= c.entry_term_sequence + 1
             THEN 1 ELSE 0
         END AS retained_next_term,
 
@@ -266,10 +255,10 @@ outcomes AS (
                  < c.entry_term_sequence + 3
             THEN NULL
             WHEN MAX(CASE WHEN ct.term_sequence = c.entry_term_sequence + 3
-                     THEN 1 ELSE 0 END) = 1
+                          THEN 1 ELSE 0 END) = 1
               OR MIN(CASE WHEN fa.pidm IS NOT NULL
-                     THEN fa.first_award_term_sequence
-                     ELSE NULL END) <= c.entry_term_sequence + 3
+                          THEN fa.first_award_term_sequence
+                          ELSE NULL END) <= c.entry_term_sequence + 3
             THEN 1 ELSE 0
         END AS retained_1yr,
 
@@ -278,10 +267,10 @@ outcomes AS (
                  < c.entry_term_sequence + 6
             THEN NULL
             WHEN MAX(CASE WHEN ct.term_sequence = c.entry_term_sequence + 6
-                     THEN 1 ELSE 0 END) = 1
+                          THEN 1 ELSE 0 END) = 1
               OR MIN(CASE WHEN fa.pidm IS NOT NULL
-                     THEN fa.first_award_term_sequence
-                     ELSE NULL END) <= c.entry_term_sequence + 6
+                          THEN fa.first_award_term_sequence
+                          ELSE NULL END) <= c.entry_term_sequence + 6
             THEN 1 ELSE 0
         END AS retained_2yr,
 
@@ -290,35 +279,26 @@ outcomes AS (
                  < c.entry_term_sequence + 9
             THEN NULL
             WHEN MAX(CASE WHEN ct.term_sequence = c.entry_term_sequence + 9
-                     THEN 1 ELSE 0 END) = 1
+                          THEN 1 ELSE 0 END) = 1
               OR MIN(CASE WHEN fa.pidm IS NOT NULL
-                     THEN fa.first_award_term_sequence
-                     ELSE NULL END) <= c.entry_term_sequence + 9
+                          THEN fa.first_award_term_sequence
+                          ELSE NULL END) <= c.entry_term_sequence + 9
             THEN 1 ELSE 0
         END AS retained_3yr,
 
+        -- OPTIMIZATION: Replaced the destructive correlated scalar subquery 
+        -- with standard, set-based conditional aggregation.
         MAX(CASE
-            WHEN ebt.cum_earned_hrs >= 12
-             AND ebt.term_id <= (
-                SELECT MIN(e2.term_id) FROM earned_by_term e2
-                WHERE e2.pidm = c.pidm
-                AND e2.cum_earned_hrs >= 12
-                AND e2.term_id >= c.cohort_entry_term_id)
+            WHEN ebt.term_id >= c.cohort_entry_term_id AND ebt.cum_earned_hrs >= 12
             THEN 1 ELSE 0
         END) AS earned_12cr_flag,
 
         MAX(CASE
-            WHEN ebt.cum_earned_hrs >= 24
-             AND ebt.term_id <= (
-                SELECT MIN(e2.term_id) FROM earned_by_term e2
-                WHERE e2.pidm = c.pidm
-                AND e2.cum_earned_hrs >= 24
-                AND e2.term_id >= c.cohort_entry_term_id)
+            WHEN ebt.term_id >= c.cohort_entry_term_id AND ebt.cum_earned_hrs >= 24
             THEN 1 ELSE 0
         END) AS earned_24cr_flag,
 
-        MAX(CASE WHEN fa.pidm IS NOT NULL THEN 1 ELSE 0 END)
-            AS received_award_flag,
+        MAX(CASE WHEN fa.pidm IS NOT NULL THEN 1 ELSE 0 END) AS received_award_flag,
         MIN(fa.first_award_term_id)     AS first_award_term_id,
         MIN(fa.first_award_degree_code) AS first_award_degree_code,
         MIN(fa.first_award_major_code)  AS first_award_major_code,
@@ -342,14 +322,7 @@ outcomes AS (
         c.prior_cum_hrs, c.misclassified_dm_flag, c.de_as_dm_flag
 ),
 
--- ============================================================
--- Current state CTEs
--- Bounded to cohort pidms via post_enr join — no full
--- SORLCUR scan against all SFVRCRS rows.
--- ============================================================
 sorlcur_at_term AS (
-    -- Full validated ordering: most recent effective SORLCUR term
-    -- first, then lowest priority, then highest sequence number.
     SELECT pidm, term_id, major_code
     FROM (
         SELECT
@@ -367,14 +340,39 @@ sorlcur_at_term AS (
         AND   SORLCUR_CACT_CODE   = 'ACTIVE'
         AND   SORLCUR_TERM_CODE  >= :Term
         AND   SORLCUR_TERM_CODE  <= F_RSCC_GET_TERM('TERM1')
+        AND   SORLCUR_PIDM IN (SELECT pidm FROM cohort_pidms)
     )
     WHERE rn = 1
 ),
 
+-- OPTIMIZATION: Pulled out sequence evaluation into its own consolidated layout 
+-- to eliminate the redundant inline scan against cohort and post_enr.
+last_dedm_term AS (
+    SELECT
+        c.cohort_id,
+        c.pidm,
+        MAX(pe.term_id)         AS last_dedm_term_id,
+        MAX(td.term_sequence)   AS last_dedm_seq,
+        CASE
+            WHEN SUBSTR(MAX(pe.term_id), 5, 2) = '80'
+            THEN TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '10'
+            ELSE SUBSTR(MAX(pe.term_id), 1, 4) || '80'
+        END                     AS next_fs_1,
+        CASE
+            WHEN SUBSTR(MAX(pe.term_id), 5, 2) = '80'
+            THEN TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '80'
+            ELSE TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '10'
+        END                     AS next_fs_2
+    FROM cohort c
+    JOIN post_enr pe
+        ON  pe.pidm      = c.pidm
+        AND pe.admt_code IN ('DE', 'DM', 'JE', 'AT')
+    JOIN term_dim td
+        ON  td.term_id = pe.term_id
+    GROUP BY c.cohort_id, c.pidm
+),
+
 matriculation AS (
-    -- First term enrolled with non-DE/DM admit code after cohort entry,
-    -- within 4 term sequences of last DE/DM term.
-    -- Requires non-NDUG SORLCUR major (real program, not non-degree).
     SELECT
         c.cohort_id,
         MIN(pe.term_id)         AS first_rscc_term_id,
@@ -390,44 +388,10 @@ matriculation AS (
         ON  sat.pidm       = pe.pidm
         AND sat.term_id    = pe.term_id
         AND sat.major_code != 'NDUG'
-    JOIN (
-        SELECT
-            c2.cohort_id,
-            MAX(td2.term_sequence) AS last_dedm_seq
-        FROM cohort c2
-        JOIN post_enr pe2
-            ON  pe2.pidm      = c2.pidm
-            AND pe2.admt_code IN ('DE', 'DM', 'JE', 'AT')
-        JOIN term_dim td2
-            ON  td2.term_id   = pe2.term_id
-        GROUP BY c2.cohort_id
-    ) ldm
-        ON  ldm.cohort_id      = c.cohort_id
-        AND td.term_sequence  <= ldm.last_dedm_seq + 4
+    JOIN last_dedm_term ldt
+        ON  ldt.cohort_id  = c.cohort_id
+        AND td.term_sequence  <= ldt.last_dedm_seq + 4
     GROUP BY c.cohort_id
-),
-
-last_dedm_term AS (
-    -- Last DE/DM enrollment term; derives next two FS term window.
-    SELECT
-        c.cohort_id,
-        c.pidm,
-        MAX(pe.term_id)         AS last_dedm_term_id,
-        CASE
-            WHEN SUBSTR(MAX(pe.term_id), 5, 2) = '80'
-            THEN TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '10'
-            ELSE SUBSTR(MAX(pe.term_id), 1, 4) || '80'
-        END                     AS next_fs_1,
-        CASE
-            WHEN SUBSTR(MAX(pe.term_id), 5, 2) = '80'
-            THEN TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '80'
-            ELSE TO_CHAR(TO_NUMBER(SUBSTR(MAX(pe.term_id), 1, 4)) + 1) || '10'
-        END                     AS next_fs_2
-    FROM cohort c
-    JOIN post_enr pe
-        ON  pe.pidm      = c.pidm
-        AND pe.admt_code IN ('DE', 'DM', 'JE', 'AT')
-    GROUP BY c.cohort_id, c.pidm
 ),
 
 student_max_term AS (
@@ -469,8 +433,6 @@ current_major AS (
 ),
 
 next_term_mat AS (
-    -- Flag: enrolled in non-DE/DM program within next two FS terms
-    -- after last DE/DM term (two-term gap tolerance).
     SELECT
         ldt.cohort_id,
         MAX(CASE
@@ -526,11 +488,6 @@ SELECT
     o.first_award_major_code,
     o.time_to_award_terms,
     NULL                                        AS inst_time_to_award_terms,
-    -- ============================================================
-    -- Graduation and matriculation flags
-    -- graduated_in_program: awarded before any RSCC enrollment
-    -- graduated_rscc: awarded on or after first RSCC enrollment
-    -- ============================================================
     CASE
         WHEN o.received_award_flag = 1
             AND (mat.first_rscc_term_id IS NULL
@@ -547,9 +504,6 @@ SELECT
             AND o.first_award_term_id >= mat.first_rscc_term_id
         THEN 1 ELSE 0
     END                                         AS graduated_rscc_flag,
-    -- ============================================================
-    -- Current state fields
-    -- ============================================================
     cm.current_term_id,
     CASE
         WHEN o.received_award_flag = 1
