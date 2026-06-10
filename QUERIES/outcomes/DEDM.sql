@@ -123,7 +123,7 @@ cohort AS (
         ON pc.pidm    = sf.PIDM_A3
         AND pc.term_id = sf.TERM_CODE_A3
     WHERE sf.TOT_CRHRS_A3   > 0
-    AND sf.TERM_CODE_A3      >= '202080'
+    AND sf.TERM_CODE_A3      >= :Term
     AND sf.TERM_CODE_A3      <= F_RSCC_GET_TERM('TERM1')
     AND sg.SGBSTDN_ADMT_CODE  IN ('DE','DM')
     GROUP BY
