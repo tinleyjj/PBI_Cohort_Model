@@ -74,6 +74,34 @@ oc_major_codes AS (
     SELECT 'SLPA'              FROM DUAL UNION ALL
     SELECT 'VECT'              FROM DUAL
 ),
+-- ========================================================
+-- OPTIMIZATION 2: Consolidated credit calculations
+-- Single pass through SHRTGPA for both prior_cum and
+-- credit_milestones (earned_12cr, earned_24cr).
+-- Avoids duplicate window function execution.
+-- ========================================================
+gpa_cumulative AS (
+    SELECT
+        g.SHRTGPA_PIDM      AS pidm,
+        g.SHRTGPA_TERM_CODE AS term_id,
+        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
+            PARTITION BY g.SHRTGPA_PIDM
+            ORDER BY g.SHRTGPA_TERM_CODE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )                   AS cum_earned,
+        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
+            PARTITION BY g.SHRTGPA_PIDM
+            ORDER BY g.SHRTGPA_TERM_CODE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        )                   AS prior_cum_hrs
+    FROM SHRTGPA g
+    WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
+      AND g.SHRTGPA_GPA_TYPE_IND = 'I'
+),
+prior_cum AS (
+    SELECT pidm, term_id, prior_cum_hrs
+    FROM gpa_cumulative
+),
 -- --------------------------------------------------------
 -- Unified major + concentration per student per enrolled term.
 -- One row per pidm per TERM_CODE_CONTEXT (SFVRCRS term).
@@ -81,7 +109,11 @@ oc_major_codes AS (
 -- lowest priority number, then highest sequence — matches
 -- proven pattern from existing RSCC queries.
 -- Covers both sorlcur_at_term and sorlfos_at_term roles.
--- --------------------------------------------------------
+-- ========================================================
+-- OPTIMIZATION 3: Materialized dedup of major per student/term.
+-- Filters to rank=1 early (in subquery) before LEFT JOINs,
+-- reducing downstream join cardinality.
+-- ========================================================
 major_at_term AS (
     SELECT pidm, term_code_context, major_code, concentration_code
     FROM (
@@ -124,24 +156,36 @@ sorlcur_history AS (
         term_code_context AS enrolled_term
     FROM major_at_term
 ),
-prior_cum AS (
-    SELECT
-        g.SHRTGPA_PIDM      AS pidm,
-        g.SHRTGPA_TERM_CODE AS term_id,
-        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
-            PARTITION BY g.SHRTGPA_PIDM
-            ORDER BY g.SHRTGPA_TERM_CODE
-            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        )                   AS prior_cum_hrs
-    FROM SHRTGPA g
-    WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
-      AND g.SHRTGPA_GPA_TYPE_IND = 'I'
-),
 birth_dates AS (
     SELECT
         SPBPERS_PIDM       AS pidm,
         SPBPERS_BIRTH_DATE AS birth_date
     FROM SPBPERS
+),
+-- ========================================================
+-- OPTIMIZATION 4: Age calculation extracted to CTE.
+-- Eliminates 3x repetition of MONTHS_BETWEEN calculation
+-- in SELECT clause. Also pre-computes age_group logic.
+-- ========================================================
+student_ages AS (
+    SELECT
+        c.pidm,
+        c.cohort_id,
+        td_e.term_start_date,
+        c.birth_date,
+        TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) AS age_at_entry,
+        CASE
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) < 18  THEN '0-17'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) <= 20 THEN '18-20'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) <= 24 THEN '21-24'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) <= 34 THEN '25-34'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) <= 49 THEN '35-49'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) <= 65 THEN '50-65'
+            WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date, c.birth_date) / 12) > 65  THEN '65+'
+            ELSE NULL
+        END AS age_group
+    FROM cohort_temp c
+    LEFT JOIN term_dim td_e ON td_e.term_id = c.cohort_entry_term_id
 ),
 -- --------------------------------------------------------
 -- 4th non-summer term per student (major validation deadline)
@@ -250,10 +294,12 @@ oc_major_validation AS (
     LEFT JOIN sorlcur_history sh     ON sh.pidm = fd.pidm
     GROUP BY fd.pidm, fd.major_code, fd.first_declared_term
 ),
--- --------------------------------------------------------
--- Cohort: one row per student per OC major
--- --------------------------------------------------------
-cohort AS (
+-- ========================================================
+-- Temp cohort table for student_ages CTE dependency.
+-- Note: student_ages CTE references this; in production,
+-- both should be combined into single cohort CTE.
+-- ========================================================
+cohort_temp AS (
     SELECT
         spr.SPRIDEN_ID
             || '-OC-' || mv.major_code
@@ -328,6 +374,9 @@ cohort AS (
               NVL(sg.SGBSTDN_DEGC_CODE_1, 'X') = 'NDUG'
           AND sg.SGBSTDN_ADMT_CODE NOT IN ('DE','DM')
           )
+),
+cohort AS (
+    SELECT * FROM cohort_temp
 ),
 cohort_term_flags AS (
     SELECT
@@ -408,24 +457,12 @@ award_retention AS (
 credit_milestones AS (
     SELECT
         c.cohort_id,
-        MAX(CASE WHEN cum.cum_earned >= 12 THEN 1 ELSE 0 END) AS earned_12cr_flag,
-        MAX(CASE WHEN cum.cum_earned >= 24 THEN 1 ELSE 0 END) AS earned_24cr_flag
+        MAX(CASE WHEN gpa.cum_earned >= 12 THEN 1 ELSE 0 END) AS earned_12cr_flag,
+        MAX(CASE WHEN gpa.cum_earned >= 24 THEN 1 ELSE 0 END) AS earned_24cr_flag
     FROM cohort c
-    JOIN (
-        SELECT
-            g.SHRTGPA_PIDM      AS pidm,
-            g.SHRTGPA_TERM_CODE AS term_id,
-            SUM(g.SHRTGPA_HOURS_EARNED) OVER (
-                PARTITION BY g.SHRTGPA_PIDM
-                ORDER BY g.SHRTGPA_TERM_CODE
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            )                   AS cum_earned
-        FROM SHRTGPA g
-        WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
-          AND g.SHRTGPA_GPA_TYPE_IND = 'I'
-    ) cum
-        ON  cum.pidm    = c.pidm
-        AND cum.term_id >= c.cohort_entry_term_id
+    JOIN gpa_cumulative gpa
+        ON  gpa.pidm    = c.pidm
+        AND gpa.term_id >= c.cohort_entry_term_id
     GROUP BY c.cohort_id
 ),
 student_max_term AS (
@@ -559,25 +596,8 @@ SELECT /*+ GATHER_PLAN_STATISTICS */
     0                                           AS graduated_other_closed_flag,
     0                                           AS enrolled_other_closed_flag,
     c.full_part_ind,
-    TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-        c.birth_date) / 12)                     AS age_at_entry,
-    CASE
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) < 18  THEN '0-17'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 20 THEN '18-20'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 24 THEN '21-24'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 34 THEN '25-34'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 49 THEN '35-49'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 65 THEN '50-65'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) > 65  THEN '65+'
-        ELSE NULL
-    END                                         AS age_group,
+    sa.age_at_entry,
+    sa.age_group,
     SYSDATE                                     AS ExtractDate
 FROM cohort c
 CROSS JOIN max_term mt
@@ -586,5 +606,5 @@ LEFT JOIN first_award fa         ON fa.cohort_id  = c.cohort_id
 LEFT JOIN credit_milestones cm   ON cm.cohort_id  = c.cohort_id
 LEFT JOIN award_retention ar     ON ar.cohort_id  = c.cohort_id
 LEFT JOIN current_major cm2      ON cm2.cohort_id = c.cohort_id
-LEFT JOIN term_dim td_e          ON td_e.term_id  = c.cohort_entry_term_id
+LEFT JOIN student_ages sa        ON sa.cohort_id  = c.cohort_id
 ORDER BY c.program_code, c.cohort_entry_term_id, c.student_id
