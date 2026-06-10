@@ -7,20 +7,32 @@
 -- Output: outcomes_OC.csv via Argos SFTP
 -- Refresh cadence: Per term (full rebuild)
 --
--- Cohort anchor: first non-summer term where SORLCUR shows
---   student actively declared in an OC major AND SFVRCRS
---   shows TOT_CRHRS_A3 > 0. Summers excluded from anchor
---   and from the major validation window.
+-- Cohort membership:
+--   New/Transfer students (stu_type != C): standard entry
+--   Continuing students (stu_type = C): admitted only when
+--     they have a confirmed prior OC major (SORLCUR inactive)
+--     that differs from the current program — Option 3 logic.
 -- cohort_id: student_id-OC-major_code-YYYYTT
 --
--- oc_gateway_flag: merged in Power Query from RPT-008-OC-GW
---   on student_id + program_code.
+-- program_entry_type:
+--   NEW            = first-time or transfer entry
+--   PROGRAM_SWITCH = continuing student from prior OC major
+--
+-- Two time clocks:
+--   cohort_entry_term_id    = first non-summer term in this
+--                             program (program clock)
+--   inst_entry_term_id      = first non-summer degree-seeking
+--                             term at RSCC (institutional clock)
+--   time_to_award_terms     = award relative to program clock
+--   inst_time_to_award_terms= award relative to inst clock
 --
 -- Major validation window: 4th non-summer term at RSCC.
 --   Late/missing declarations flagged, not excluded.
---
 -- Column order matches master union schema (CLOSED reference).
--- No SFVSTMS scan in this query — see RPT-008-OC-GW.
+-- Age and FT/PT demographics live on RPT002b cohort table.
+--
+-- Parameters:
+--   :Term  -- cohort floor term (e.g. 202080)
 -- ==================================================
 
 WITH
@@ -34,7 +46,6 @@ term_dim AS (
     LEFT JOIN SOBPTRM b
         ON  b.SOBPTRM_TERM_CODE = t.STVTERM_CODE
         AND b.SOBPTRM_PTRM_CODE = '1'
-    WHERE SUBSTR(t.STVTERM_CODE, 5, 2) IN ('10','50','80')
 ),
 max_term AS (
     SELECT MAX(term_sequence) AS max_seq FROM term_dim
@@ -66,13 +77,38 @@ oc_major_codes AS (
     SELECT 'SLPA'              FROM DUAL UNION ALL
     SELECT 'VECT'              FROM DUAL
 ),
+-- ========================================================
+-- Single pass through SHRTGPA for both prior_cum and
+-- credit_milestones (earned_12cr, earned_24cr).
+-- ========================================================
+gpa_cumulative AS (
+    SELECT
+        g.SHRTGPA_PIDM      AS pidm,
+        g.SHRTGPA_TERM_CODE AS term_id,
+        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
+            PARTITION BY g.SHRTGPA_PIDM
+            ORDER BY g.SHRTGPA_TERM_CODE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )                   AS cum_earned,
+        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
+            PARTITION BY g.SHRTGPA_PIDM
+            ORDER BY g.SHRTGPA_TERM_CODE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        )                   AS prior_cum_hrs
+    FROM SHRTGPA g
+    WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
+      AND g.SHRTGPA_GPA_TYPE_IND = 'I'
+),
+prior_cum AS (
+    SELECT pidm, term_id, prior_cum_hrs
+    FROM gpa_cumulative
+),
 -- --------------------------------------------------------
 -- Unified major + concentration per student per enrolled term.
 -- One row per pidm per TERM_CODE_CONTEXT (SFVRCRS term).
--- Ordering: most recent effective SORLCUR term first, then
--- lowest priority number, then highest sequence — matches
--- proven pattern from existing RSCC queries.
--- Covers both sorlcur_at_term and sorlfos_at_term roles.
+-- Ordering matches proven RSCC pattern:
+--   most recent effective SORLCUR term, lowest priority,
+--   highest sequence number.
 -- --------------------------------------------------------
 major_at_term AS (
     SELECT pidm, term_code_context, major_code, concentration_code
@@ -84,9 +120,9 @@ major_at_term AS (
             sf.TERM_CODE_A3        AS term_code_context,
             ROW_NUMBER() OVER (
                 PARTITION BY d.SORLCUR_PIDM, sf.TERM_CODE_A3
-                ORDER BY d.SORLCUR_TERM_CODE  DESC,
-                         d.SORLCUR_PRIORITY_NO ASC,
-                         d.SORLCUR_SEQNO       DESC
+                ORDER BY d.SORLCUR_TERM_CODE   DESC,
+                         d.SORLCUR_PRIORITY_NO  ASC,
+                         d.SORLCUR_SEQNO        DESC
             )                      AS row_1
         FROM SORLCUR d
         JOIN SFVRCRS sf
@@ -95,10 +131,10 @@ major_at_term AS (
             AND sf.TERM_CODE_A3 >= :Term
             AND sf.TERM_CODE_A3 <= F_RSCC_GET_TERM('TERM1')
         LEFT JOIN SORLFOS lf
-            ON  lf.SORLFOS_PIDM      = d.SORLCUR_PIDM
-            AND lf.SORLFOS_LCUR_SEQNO = d.SORLCUR_SEQNO
-            AND lf.SORLFOS_LFST_CODE = 'CONCENTRATION'
-            AND lf.SORLFOS_CSTS_CODE = 'INPROGRESS'
+            ON  lf.SORLFOS_PIDM       = d.SORLCUR_PIDM
+            AND lf.SORLFOS_LCUR_SEQNO  = d.SORLCUR_SEQNO
+            AND lf.SORLFOS_LFST_CODE   = 'CONCENTRATION'
+            AND lf.SORLFOS_CSTS_CODE   = 'INPROGRESS'
         WHERE d.SORLCUR_LMOD_CODE = 'LEARNER'
           AND d.SORLCUR_CACT_CODE = 'ACTIVE'
           AND d.SORLCUR_TERM_CODE <= sf.TERM_CODE_A3
@@ -115,25 +151,6 @@ sorlcur_history AS (
         major_code,
         term_code_context AS enrolled_term
     FROM major_at_term
-),
-prior_cum AS (
-    SELECT
-        g.SHRTGPA_PIDM      AS pidm,
-        g.SHRTGPA_TERM_CODE AS term_id,
-        SUM(g.SHRTGPA_HOURS_EARNED) OVER (
-            PARTITION BY g.SHRTGPA_PIDM
-            ORDER BY g.SHRTGPA_TERM_CODE
-            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        )                   AS prior_cum_hrs
-    FROM SHRTGPA g
-    WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
-      AND g.SHRTGPA_GPA_TYPE_IND = 'I'
-),
-birth_dates AS (
-    SELECT
-        SPBPERS_PIDM       AS pidm,
-        SPBPERS_BIRTH_DATE AS birth_date
-    FROM SPBPERS
 ),
 -- --------------------------------------------------------
 -- 4th non-summer term per student (major validation deadline)
@@ -155,6 +172,51 @@ student_fourth_term AS (
           AND TERM_CODE_A3 <= F_RSCC_GET_TERM('TERM1')
     )
     WHERE rscc_term_seq = 4
+),
+-- --------------------------------------------------------
+-- Degree-seeking enrollment terms per student.
+-- Excludes summers, NDUG, and zero-credit terms.
+-- All degree-seeking students included regardless of stu_type;
+-- stu_type C filtering is handled at cohort membership level.
+-- --------------------------------------------------------
+degree_seeking_terms AS (
+    SELECT
+        sf.PIDM_A3      AS pidm,
+        sf.TERM_CODE_A3 AS term_id
+    FROM SFVRCRS sf
+    JOIN SGBSTDN sg
+        ON  sg.ROWID = F_GET_SGBSTDN_ROWID(sf.PIDM_A3, sf.TERM_CODE_A3)
+    WHERE sf.TOT_CRHRS_A3  > 0
+      AND SUBSTR(sf.TERM_CODE_A3, 5, 2) != '50'
+      AND sf.TERM_CODE_A3 >= :Term
+      AND sf.TERM_CODE_A3 <= F_RSCC_GET_TERM('TERM1')
+      AND NVL(sg.SGBSTDN_DEGC_CODE_1, 'X') != 'NDUG'
+),
+-- --------------------------------------------------------
+-- First degree-seeking non-summer term per student
+-- (institutional clock anchor)
+-- --------------------------------------------------------
+inst_entry_term AS (
+    SELECT
+        pidm,
+        MIN(term_id) AS inst_entry_term_id
+    FROM degree_seeking_terms
+    GROUP BY pidm
+),
+-- --------------------------------------------------------
+-- Prior declared programs per student: any inactive
+-- non-NDUG SORLCUR record. Qualifies continuing students
+-- (stu_type C) who changed programs before entering OC —
+-- covers both OC-to-OC and non-OC-to-OC switchers.
+-- --------------------------------------------------------
+prior_declared_program AS (
+    SELECT DISTINCT
+        d.SORLCUR_PIDM    AS pidm,
+        d.SORLCUR_PROGRAM AS prior_major_code
+    FROM SORLCUR d
+    WHERE d.SORLCUR_LMOD_CODE = 'LEARNER'
+      AND d.SORLCUR_CACT_CODE != 'ACTIVE'
+      AND d.SORLCUR_PROGRAM   != 'NDUG'
 ),
 -- --------------------------------------------------------
 -- Cohort anchor: first non-summer enrolled term per student
@@ -192,9 +254,6 @@ oc_major_validation AS (
     LEFT JOIN sorlcur_history sh     ON sh.pidm = fd.pidm
     GROUP BY fd.pidm, fd.major_code, fd.first_declared_term
 ),
--- --------------------------------------------------------
--- Cohort: one row per student per OC major
--- --------------------------------------------------------
 cohort AS (
     SELECT
         spr.SPRIDEN_ID
@@ -212,7 +271,13 @@ cohort AS (
         mat.concentration_code                        AS cohort_concentration_code,
         NVL(pc.prior_cum_hrs, 0)                      AS prior_cum_hrs,
         sg.SGBSTDN_FULL_PART_IND                      AS full_part_ind,
-        bp.birth_date,
+        it.inst_entry_term_id,
+        td_inst.term_sequence                         AS inst_entry_term_sequence,
+        CASE
+            WHEN pm.prior_major_code IS NOT NULL
+            THEN 'PROGRAM_SWITCH'
+            ELSE 'NEW'
+        END                                           AS program_entry_type,
         CASE
             WHEN mv.declared_by_window = 0
              AND ft.fourth_nonsummer_term IS NULL
@@ -240,11 +305,19 @@ cohort AS (
     LEFT JOIN prior_cum pc
         ON  pc.pidm    = mv.pidm
         AND pc.term_id = mv.first_declared_term
-    LEFT JOIN birth_dates bp
-        ON  bp.pidm = mv.pidm
     LEFT JOIN student_fourth_term ft
         ON  ft.pidm = mv.pidm
-    WHERE NVL(sg.SGBSTDN_STYP_CODE, 'X') != 'C'
+    LEFT JOIN inst_entry_term it
+        ON  it.pidm = mv.pidm
+    LEFT JOIN term_dim td_inst
+        ON  td_inst.term_id = it.inst_entry_term_id
+    LEFT JOIN prior_declared_program pm
+        ON  pm.pidm            = mv.pidm
+        AND pm.prior_major_code != mv.major_code
+    WHERE (
+              NVL(sg.SGBSTDN_STYP_CODE, 'X') != 'C'
+           OR pm.prior_major_code IS NOT NULL
+          )
       AND NOT (
               NVL(sg.SGBSTDN_DEGC_CODE_1, 'X') = 'NDUG'
           AND sg.SGBSTDN_ADMT_CODE NOT IN ('DE','DM')
@@ -275,22 +348,18 @@ cohort_term_flags AS (
 first_award AS (
     SELECT
         c.cohort_id,
-        MIN(shd.SHRDGMR_TERM_CODE_GRAD)               AS first_award_term_id,
-        MIN(td.term_sequence - c.entry_term_sequence)  AS time_to_award_terms,
+        MIN(shd.SHRDGMR_TERM_CODE_GRAD)                    AS first_award_term_id,
+        MIN(td.term_sequence - c.entry_term_sequence)       AS time_to_award_terms,
+        MIN(td.term_sequence - c.inst_entry_term_sequence)  AS inst_time_to_award_terms,
         MAX(CASE WHEN rn.award_rank = 1
-            THEN shd.SHRDGMR_DEGC_CODE END)            AS first_award_degree_code,
+            THEN shd.SHRDGMR_DEGC_CODE END)                AS first_award_degree_code,
         MAX(CASE WHEN rn.award_rank = 1
-            THEN shd.SHRDGMR_MAJR_CODE_1 END)          AS first_award_major_code,
+            THEN shd.SHRDGMR_MAJR_CODE_1 END)              AS first_award_major_code,
         MAX(CASE
                 WHEN shd.SHRDGMR_MAJR_CODE_1 = c.program_code THEN 1
                 ELSE 0
-            END)                                       AS graduated_in_program_flag,
-        MAX(CASE
-                WHEN shd.SHRDGMR_MAJR_CODE_1 = c.program_code
-                THEN c.program_code
-                ELSE NVL(shd.SHRDGMR_MAJR_CODE_1, 'UNKNOWN')
-            END)                                       AS first_award_program_code,
-        1                                              AS received_award_flag
+            END)                                           AS graduated_in_program_flag,
+        1                                                  AS received_award_flag
     FROM cohort c
     JOIN SHRDGMR shd
         ON  shd.SHRDGMR_PIDM           = c.pidm
@@ -325,27 +394,21 @@ award_retention AS (
     JOIN cohort c    ON  c.cohort_id = fa.cohort_id
     JOIN term_dim td ON  td.term_id  = fa.first_award_term_id
 ),
+-- --------------------------------------------------------
+-- Credit milestones: hours earned from cohort entry onward.
+-- Offset by prior_cum_hrs so transfer credits do not
+-- trigger flags before the student has earned anything
+-- under their OC program.
+-- --------------------------------------------------------
 credit_milestones AS (
     SELECT
         c.cohort_id,
-        MAX(CASE WHEN cum.cum_earned >= 12 THEN 1 ELSE 0 END) AS earned_12cr_flag,
-        MAX(CASE WHEN cum.cum_earned >= 24 THEN 1 ELSE 0 END) AS earned_24cr_flag
+        MAX(CASE WHEN gpa.cum_earned - c.prior_cum_hrs >= 12 THEN 1 ELSE 0 END) AS earned_12cr_flag,
+        MAX(CASE WHEN gpa.cum_earned - c.prior_cum_hrs >= 24 THEN 1 ELSE 0 END) AS earned_24cr_flag
     FROM cohort c
-    JOIN (
-        SELECT
-            g.SHRTGPA_PIDM      AS pidm,
-            g.SHRTGPA_TERM_CODE AS term_id,
-            SUM(g.SHRTGPA_HOURS_EARNED) OVER (
-                PARTITION BY g.SHRTGPA_PIDM
-                ORDER BY g.SHRTGPA_TERM_CODE
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            )                   AS cum_earned
-        FROM SHRTGPA g
-        WHERE g.SHRTGPA_LEVL_CODE    = 'UG'
-          AND g.SHRTGPA_GPA_TYPE_IND = 'I'
-    ) cum
-        ON  cum.pidm    = c.pidm
-        AND cum.term_id >= c.cohort_entry_term_id
+    JOIN gpa_cumulative gpa
+        ON  gpa.pidm    = c.pidm
+        AND gpa.term_id >= c.cohort_entry_term_id
     GROUP BY c.cohort_id
 ),
 student_max_term AS (
@@ -435,12 +498,18 @@ SELECT /*+ GATHER_PLAN_STATISTICS */
     NVL(fa.received_award_flag, 0)              AS received_award_flag,
     c.program_code,
     c.program_name,
-    NULL                                        AS inst_entry_term,
-    NULL                                        AS terms_since_inst_entry,
+    c.inst_entry_term_id                        AS inst_entry_term,
+    CASE
+        WHEN c.inst_entry_term_sequence IS NOT NULL
+        THEN c.entry_term_sequence - c.inst_entry_term_sequence
+        ELSE NULL
+    END                                         AS terms_since_inst_entry,
+    c.program_entry_type,
     fa.first_award_term_id,
     fa.first_award_degree_code,
     fa.first_award_major_code,
     fa.time_to_award_terms,
+    fa.inst_time_to_award_terms,
     NVL(fa.graduated_in_program_flag, 0)        AS graduated_in_program_flag,
     0                                           AS graduated_in_closed_flag,
     0                                           AS matriculated_to_rscc_flag,
@@ -473,25 +542,6 @@ SELECT /*+ GATHER_PLAN_STATISTICS */
     0                                           AS graduated_other_closed_flag,
     0                                           AS enrolled_other_closed_flag,
     c.full_part_ind,
-    TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-        c.birth_date) / 12)                     AS age_at_entry,
-    CASE
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) < 18  THEN '0-17'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 20 THEN '18-20'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 24 THEN '21-24'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 34 THEN '25-34'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 49 THEN '35-49'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) <= 65 THEN '50-65'
-        WHEN TRUNC(MONTHS_BETWEEN(td_e.term_start_date,
-             c.birth_date) / 12) > 65  THEN '65+'
-        ELSE NULL
-    END                                         AS age_group,
     SYSDATE                                     AS ExtractDate
 FROM cohort c
 CROSS JOIN max_term mt
@@ -500,5 +550,4 @@ LEFT JOIN first_award fa         ON fa.cohort_id  = c.cohort_id
 LEFT JOIN credit_milestones cm   ON cm.cohort_id  = c.cohort_id
 LEFT JOIN award_retention ar     ON ar.cohort_id  = c.cohort_id
 LEFT JOIN current_major cm2      ON cm2.cohort_id = c.cohort_id
-LEFT JOIN term_dim td_e          ON td_e.term_id  = c.cohort_entry_term_id
 ORDER BY c.program_code, c.cohort_entry_term_id, c.student_id
