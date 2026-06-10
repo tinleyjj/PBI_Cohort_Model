@@ -90,7 +90,7 @@ sorlcur_at_term AS (
         FROM SORLCUR
         WHERE SORLCUR_LMOD_CODE   = 'LEARNER'
           AND SORLCUR_CACT_CODE   = 'ACTIVE'
-          AND SORLCUR_TERM_CODE   >= '202080'
+          AND SORLCUR_TERM_CODE   >= :Term
           AND SORLCUR_TERM_CODE   <= F_RSCC_GET_TERM('TERM1')
     )
     WHERE rn = 1
@@ -115,7 +115,7 @@ enrollment_spine AS (
                 ORDER BY SFVSTMS_PRIMARY_IND NULLS LAST
             ) AS row_num
         FROM SFVSTMS
-        WHERE SFVSTMS_TERM_CODE >= '202080'
+        WHERE SFVSTMS_TERM_CODE >= :Term
           AND SFVSTMS_TERM_CODE <= F_RSCC_GET_TERM('TERM1')
     ) ri
     WHERE ri.row_num = 1
