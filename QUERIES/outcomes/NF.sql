@@ -4,6 +4,7 @@
 -- Grain: one row per student per cohort entry term
 -- Output: outcomes_NF.csv via Argos SFTP
 -- Refresh cadence: Per term (full rebuild)
+-- Union schema: 51 columns (v1)
 --
 -- Cohort rule: SORLCUR_ADMT_CODE = 'FR' (as-of term)
 --   + SGBSTDN_STYP_CODE IN ('N','B').
@@ -13,7 +14,6 @@
 -- B students (summer starters) shift cohort_entry_term_id
 --   to following Fall; entry_seq joins on shifted term
 --   so retention window arithmetic is correct.
--- Structure mirrors outcomes_DE_DM for consistency.
 -- ==================================================
 
 WITH
@@ -21,23 +21,41 @@ WITH
 term_dim AS (
     SELECT
         t.STVTERM_CODE                               AS term_id,
-        ROW_NUMBER() OVER (ORDER BY t.STVTERM_CODE)  AS term_sequence,
-        b.SOBPTRM_START_DATE                         AS term_start_date
+        ROW_NUMBER() OVER (ORDER BY t.STVTERM_CODE)  AS term_sequence
     FROM STVTERM t
-    LEFT JOIN SOBPTRM b
-        ON  b.SOBPTRM_TERM_CODE = t.STVTERM_CODE
-        AND b.SOBPTRM_PTRM_CODE = '1'
 ),
 
 max_term AS (
     SELECT MAX(term_sequence) AS max_seq FROM term_dim
 ),
 
-birth_dates AS (
-    SELECT
-        SPBPERS_PIDM    AS pidm,
-        SPBPERS_BIRTH_DATE AS birth_date
-    FROM SPBPERS
+current_fs_term AS (
+    -- Most recent Fall or Spring term up to TERM1.
+    -- Used for currently_enrolled_flag to avoid summer enrollment artifacts.
+    SELECT MAX(STVTERM_CODE) AS fs_term_id
+    FROM STVTERM
+    WHERE STVTERM_CODE <= F_RSCC_GET_TERM('TERM1')
+    AND   SUBSTR(STVTERM_CODE, 5, 2) IN ('10', '80')
+),
+
+-- Closed program major codes for graduated_in_closed / enrolled_in_closed flags
+program_codes AS (
+    SELECT 'ADHT' AS major_code FROM DUAL UNION ALL
+    SELECT 'DHTH'               FROM DUAL UNION ALL
+    SELECT 'NURT'               FROM DUAL UNION ALL
+    SELECT 'NURH'               FROM DUAL UNION ALL
+    SELECT 'NURL'               FROM DUAL UNION ALL
+    SELECT 'AOTA'               FROM DUAL UNION ALL
+    SELECT 'OTAH'               FROM DUAL UNION ALL
+    SELECT 'APTA'               FROM DUAL UNION ALL
+    SELECT 'PTAH'               FROM DUAL UNION ALL
+    SELECT 'ARDT'               FROM DUAL UNION ALL
+    SELECT 'RDTH'               FROM DUAL UNION ALL
+    SELECT 'ARSP'               FROM DUAL UNION ALL
+    SELECT 'ARTT'               FROM DUAL UNION ALL
+    SELECT 'RTTH'               FROM DUAL UNION ALL
+    SELECT 'ASRG'               FROM DUAL UNION ALL
+    SELECT 'SRGH'               FROM DUAL
 ),
 
 nf_raw AS (
@@ -159,8 +177,13 @@ all_outcomes AS (
         MAX(CASE WHEN g_cum.cum_earned >= 24 THEN 1 ELSE 0 END)         AS earned_24cr,
         MIN(shd.SHRDGMR_TERM_CODE_GRAD)                                 AS award_term,
         MIN(td_aw.term_sequence)                                        AS award_seq,
-        MIN(shd.SHRDGMR_DEGC_CODE)                                      AS award_degree,
-        MIN(shd.SHRDGMR_MAJR_CODE_1)                                    AS award_major
+        -- Use award_rank = 1 to correlate degree and major from the same
+        -- earliest award row. MIN() on independent columns can pull from
+        -- different rows when a student has multiple awards.
+        MAX(CASE WHEN shd.award_rank = 1
+            THEN shd.SHRDGMR_DEGC_CODE END)                             AS award_degree,
+        MAX(CASE WHEN shd.award_rank = 1
+            THEN shd.SHRDGMR_MAJR_CODE_1 END)                          AS award_major
     FROM master_cohort mc
     LEFT JOIN SFVRCRS sf_post
         ON  sf_post.PIDM_A3      = mc.pidm
@@ -182,13 +205,89 @@ all_outcomes AS (
     ) g_cum
         ON  g_cum.SHRTGPA_PIDM      = mc.pidm
         AND g_cum.SHRTGPA_TERM_CODE >= mc.cohort_entry_term_id
-    LEFT JOIN SHRDGMR shd
-        ON  shd.SHRDGMR_PIDM           = mc.pidm
-        AND shd.SHRDGMR_DEGS_CODE      = 'AW'
-        AND shd.SHRDGMR_TERM_CODE_GRAD >= mc.cohort_entry_term_id
+    LEFT JOIN (
+        SELECT
+            shd2.SHRDGMR_PIDM,
+            shd2.SHRDGMR_TERM_CODE_GRAD,
+            shd2.SHRDGMR_DEGC_CODE,
+            shd2.SHRDGMR_MAJR_CODE_1,
+            ROW_NUMBER() OVER (
+                PARTITION BY shd2.SHRDGMR_PIDM
+                ORDER BY shd2.SHRDGMR_TERM_CODE_GRAD ASC
+            ) AS award_rank
+        FROM SHRDGMR shd2
+        JOIN master_cohort mc2
+            ON  mc2.pidm                     = shd2.SHRDGMR_PIDM
+            AND shd2.SHRDGMR_TERM_CODE_GRAD >= mc2.cohort_entry_term_id
+        WHERE shd2.SHRDGMR_DEGS_CODE = 'AW'
+    ) shd
+        ON  shd.SHRDGMR_PIDM = mc.pidm
     LEFT JOIN term_dim td_aw
         ON  td_aw.term_id = shd.SHRDGMR_TERM_CODE_GRAD
     GROUP BY mc.pidm
+),
+
+-- ============================================================
+-- Current state CTEs
+-- ============================================================
+sorlcur_current AS (
+    -- Standalone current-term SORLCUR for last_major_code lookup.
+    -- Separate from nf_raw lae subquery (which uses as-of-term logic).
+    -- Uses full validated ordering: most recent effective term first,
+    -- then lowest priority, then highest sequence number.
+    SELECT pidm, term_id, major_code
+    FROM (
+        SELECT
+            SORLCUR_PIDM        AS pidm,
+            SORLCUR_TERM_CODE   AS term_id,
+            SORLCUR_PROGRAM     AS major_code,
+            ROW_NUMBER() OVER (
+                PARTITION BY SORLCUR_PIDM, SORLCUR_TERM_CODE
+                ORDER BY SORLCUR_TERM_CODE   DESC,
+                         SORLCUR_PRIORITY_NO  ASC,
+                         SORLCUR_SEQNO        DESC
+            )                   AS rn
+        FROM SORLCUR
+        WHERE SORLCUR_LMOD_CODE   = 'LEARNER'
+        AND   SORLCUR_CACT_CODE   = 'ACTIVE'
+        AND   SORLCUR_TERM_CODE  >= :Term
+        AND   SORLCUR_TERM_CODE  <= F_RSCC_GET_TERM('TERM1')
+    )
+    WHERE rn = 1
+),
+
+student_max_term AS (
+    SELECT
+        mc.pidm,
+        MAX(sf.TERM_CODE_A3)    AS current_term_id,
+        CASE
+            WHEN SUM(CASE
+                WHEN sf.TERM_CODE_A3 = (SELECT fs_term_id FROM current_fs_term)
+                     AND sf.TOT_CRHRS_A3 > 0 THEN 1 ELSE 0
+            END) > 0
+            THEN 1 ELSE 0
+        END                     AS currently_enrolled_flag
+    FROM master_cohort mc
+    LEFT JOIN SFVRCRS sf
+        ON  sf.PIDM_A3      = mc.pidm
+        AND sf.TOT_CRHRS_A3 > 0
+        AND sf.TERM_CODE_A3 > mc.cohort_entry_term_id
+        AND sf.TERM_CODE_A3 <= F_RSCC_GET_TERM('TERM1')
+    GROUP BY mc.pidm
+),
+
+current_major AS (
+    SELECT
+        smt.pidm,
+        smt.current_term_id,
+        smt.currently_enrolled_flag,
+        COALESCE(sc.major_code, mc.major_code)  AS current_major_code
+    FROM student_max_term smt
+    LEFT JOIN sorlcur_current sc
+        ON  sc.pidm    = smt.pidm
+        AND sc.term_id = smt.current_term_id
+    LEFT JOIN master_cohort mc
+        ON  mc.pidm    = smt.pidm
 )
 
 SELECT
@@ -209,55 +308,92 @@ SELECT
         WHEN mc.stu_type     = 'B' THEN 'Process Error: Fall Bridge recoded to New'
         WHEN o.prior_cum_hrs > 12  THEN 'Data Integrity: NF with Prior Inst Credits'
         ELSE 'Clean'
-    END                                                          AS audit_error_type,
+    END                                                          AS error_flag,
+    0                                                            AS misclassified_dm_flag,
+    0                                                            AS de_as_dm_flag,
     mt.max_seq,
     CASE WHEN mt.max_seq < mc.entry_seq + 1 THEN NULL
-         WHEN o.has_t1 = 1 OR o.award_seq <= mc.entry_seq + 1 THEN 1 ELSE 0 END AS retained_next_term,
+         WHEN o.has_t1 = 1 OR o.award_seq <= mc.entry_seq + 1 THEN 1 ELSE 0
+    END                                                          AS retained_next_term,
     CASE WHEN mt.max_seq < mc.entry_seq + 3 THEN NULL
-         WHEN o.has_t3 = 1 OR o.award_seq <= mc.entry_seq + 3 THEN 1 ELSE 0 END AS retained_1yr,
+         WHEN o.has_t3 = 1 OR o.award_seq <= mc.entry_seq + 3 THEN 1 ELSE 0
+    END                                                          AS retained_1yr,
     CASE WHEN mt.max_seq < mc.entry_seq + 6 THEN NULL
-         WHEN o.has_t6 = 1 OR o.award_seq <= mc.entry_seq + 6 THEN 1 ELSE 0 END AS retained_2yr,
+         WHEN o.has_t6 = 1 OR o.award_seq <= mc.entry_seq + 6 THEN 1 ELSE 0
+    END                                                          AS retained_2yr,
     CASE WHEN mt.max_seq < mc.entry_seq + 9 THEN NULL
-         WHEN o.has_t9 = 1 OR o.award_seq <= mc.entry_seq + 9 THEN 1 ELSE 0 END AS retained_3yr,
+         WHEN o.has_t9 = 1 OR o.award_seq <= mc.entry_seq + 9 THEN 1 ELSE 0
+    END                                                          AS retained_3yr,
     0                                                            AS retained_in_major_t1,
     NVL(o.earned_12cr, 0)                                        AS earned_12cr_flag,
     NVL(o.earned_24cr, 0)                                        AS earned_24cr_flag,
     CASE WHEN o.award_term IS NOT NULL THEN 1 ELSE 0 END         AS received_award_flag,
-    0                                                            AS graduated_in_major_flag,
+    NULL                                                         AS program_code,
+    NULL                                                         AS program_name,
+    NULL                                                         AS inst_entry_term,
+    NULL                                                         AS terms_since_inst_entry,
+    NULL                                                         AS program_entry_type,
     o.award_term                                                 AS first_award_term_id,
     o.award_degree                                               AS first_award_degree_code,
     o.award_major                                                AS first_award_major_code,
     (o.award_seq - mc.entry_seq)                                 AS time_to_award_terms,
-    NULL                                                         AS inst_entry_term,
-    NULL                                                         AS terms_since_inst_entry,
-    sg2.SGBSTDN_FULL_PART_IND                                    AS full_part_ind,
-    TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-        bp.birth_date) / 12)                                     AS age_at_entry,
+    NULL                                                         AS inst_time_to_award_terms,
+    -- ============================================================
+    -- Graduation flags
+    -- graduated_in_program: awarded in NF entry major (not a closed program)
+    -- graduated_in_closed:  awarded in any closed program major
+    -- ============================================================
     CASE
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) < 18  THEN '0-17'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) <= 20 THEN '18-20'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) <= 24 THEN '21-24'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) <= 34 THEN '25-34'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) <= 49 THEN '35-49'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) <= 65 THEN '50-65'
-        WHEN TRUNC(MONTHS_BETWEEN(td_entry.term_start_date,
-             bp.birth_date) / 12) > 65  THEN '65+'
-        ELSE NULL
-    END                                                          AS age_group,
+        WHEN o.award_term IS NOT NULL
+            AND o.award_major = mc.major_code
+            AND o.award_major NOT IN (SELECT major_code FROM program_codes)
+        THEN 1 ELSE 0
+    END                                                          AS graduated_in_program_flag,
+    CASE
+        WHEN o.award_term IS NOT NULL
+            AND o.award_major IN (SELECT major_code FROM program_codes)
+        THEN 1 ELSE 0
+    END                                                          AS graduated_in_closed_flag,
+    0                                                            AS matriculated_to_rscc_flag,
+    0                                                            AS graduated_rscc_flag,
+    -- ============================================================
+    -- Current state fields
+    -- ============================================================
+    cm.current_term_id,
+    CASE
+        WHEN o.award_term IS NOT NULL
+            THEN o.award_major
+        ELSE cm.current_major_code
+    END                                                          AS last_major_code,
+    CASE
+        WHEN o.award_term IS NOT NULL
+            THEN F_STUDENT_GET_DESC('STVMAJR', o.award_major, 30)
+        ELSE F_STUDENT_GET_DESC('STVMAJR', cm.current_major_code, 30)
+    END                                                          AS last_major_desc,
+    cm.currently_enrolled_flag,
+    0                                                            AS enrolled_rscc_flag,
+    CASE
+        WHEN cm.currently_enrolled_flag = 1
+            AND cm.current_major_code IN (SELECT major_code FROM program_codes)
+        THEN 1 ELSE 0
+    END                                                          AS enrolled_in_closed_flag,
+    CASE
+        WHEN o.award_term IS NOT NULL
+            AND o.award_major = mc.major_code
+            THEN 'Same Major'
+        WHEN o.award_term IS NOT NULL
+            THEN 'Changed Major'
+        WHEN cm.current_major_code = mc.major_code
+            THEN 'Same Major'
+        ELSE 'Changed Major'
+    END                                                          AS major_change_flag,
+    0                                                            AS next_term_matriculation_flag,
+    0                                                            AS graduated_other_closed_flag,
+    0                                                            AS enrolled_other_closed_flag,
+    NULL                                                         AS oc_gateway_flag,
     SYSDATE                                                      AS ExtractDate
 FROM master_cohort mc
 CROSS JOIN max_term mt
-JOIN all_outcomes o ON o.pidm = mc.pidm
-LEFT JOIN birth_dates bp
-    ON  bp.pidm = mc.pidm
-LEFT JOIN SGBSTDN sg2
-    ON  sg2.ROWID = F_GET_SGBSTDN_ROWID(mc.pidm, mc.cohort_entry_term_id)
-LEFT JOIN term_dim td_entry
-    ON  td_entry.term_id = mc.cohort_entry_term_id
+JOIN      all_outcomes o   ON  o.pidm  = mc.pidm
+LEFT JOIN current_major cm ON cm.pidm  = mc.pidm
 ORDER BY mc.cohort_entry_term_id, mc.student_id
